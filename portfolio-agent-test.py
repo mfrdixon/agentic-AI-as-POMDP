@@ -8,14 +8,18 @@
 #   RUN_OPENAI=1 python pomdp_agentic_ai_portfolio_validation.py
 
 import os, json, time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace 
 import numpy as np
 import pandas as pd
 #from alpha_vantage.timeseries import TimeSeries
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.gridspec import GridSpec
+import textwrap
 from scipy.optimize import minimize
 from openai import OpenAI
 import requests
+from scipy.stats import chi2
 
 OUT = "pomdp_results"
 os.makedirs(OUT, exist_ok=True)
@@ -25,13 +29,29 @@ TICKERS = ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "JPM", "IBM", "GLD", "TLT", 
 RISKY = ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "JPM", "IBM", "GLD", "TLT"]
 BENCHMARK = "SPY"
 
+BELIEF_EVENTS = [
+    #("2024-08-05", "Yen carry unwind / VIX shock"),
+    ("2025-01-27", "DeepSeek AI selloff"),
+    ("2025-04-02", "Tariff uncertainty"),
+    ("2026-04-29", "Fed / delayed cuts"),
+    ("2026-06-08", "Geopolitical / oil risk"),
+]
+
 MACRO_TICKERS = {
-    "VIX": "VIXY",      # VIX futures ETF proxy; avoids index-plan 403
-    "OIL": "USO",      # crude oil ETF proxy
-    "GOLD": "GLD",     # gold ETF proxy
-    "HYG": "HYG",      # high-yield credit ETF
-    "LQD": "LQD",      # investment-grade credit ETF
+    "VIX":  "VIXY",  # VIX futures ETF proxy
+    "OIL":  "USO",   # crude oil ETF proxy
+    "GOLD": "GLD",   # gold ETF proxy
+    "HYG":  "HYG",   # high-yield corporate credit ETF
+    "LQD":  "LQD",   # investment-grade corporate credit ETF
 }
+
+ABLATION_MODES = [
+    "Historical_Only",
+    "Market_Only",
+    "Market_Plus_Direct_Macro",
+    "Market_Plus_Beliefs",
+    "Full_POMDP_Macro_Inferred_Beliefs",
+]
 
 LLM_STATES = [
     "AI_Boom",
@@ -41,14 +61,44 @@ LLM_STATES = [
     "Crisis",
 ]
 
+BELIEF_STATE_COLS = [
+    "AI_Boom",
+    "Soft_Landing",
+    "Inflation_Shock",
+    "Recession",
+    "Crisis",
+]
+
+
+MACRO_EVENTS = [
+    ("2024-06-12", "Fed higher-for-longer"),
+    ("2024-08-05", "Volatility spike"),
+    ("2024-11-06", "US election repricing"),
+    ("2025-01-27", "AI / tech volatility"),
+    ("2025-04-02", "Tariff uncertainty"),
+    ("2025-09-18", "Fed cut expectations"),
+    ("2026-04-29", "Delayed cuts"),
+    ("2026-06-08", "Geopolitical / oil risk"),
+]
+
+
+SENSITIVITY_GRID = {
+    "risk_aversion": [2.0, 3.5, 5.0],
+    "prior_shrinkage": [0.10, 0.25, 0.50],
+    "view_weight": [0.40, 0.65, 0.80],
+}
+
 START = "2024-06-10"
-END = None
+#END = None
+END = "2026-06-14"
+#END_DATE = pd.Timestamp(date.today()).normalize()
+#FORWARD_DAYS = 21
 FORWARD_DAYS = 21
 LOOKBACK_DAYS = 100
 REBALANCE_FREQ = "ME"
 RISK_AVERSION = 3.5
 MODEL = "gpt-5"
-SLEEP_BETWEEN_OPENAI_CALLS = 10
+SLEEP_BETWEEN_OPENAI_CALLS = 20.0
 
 
 # -----------------------------
@@ -68,6 +118,28 @@ def save_latex_table(df, path, caption, label, float_format="%.4f"):
         f.write(latex)
 
 
+def set_quant_journal_style():
+    plt.rcParams.update({
+        "figure.dpi": 160,
+        "savefig.dpi": 400,
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "font.size": 10,
+        "axes.titlesize": 12,
+        "axes.labelsize": 10,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 0.8,
+        "grid.alpha": 0.22,
+        "grid.linestyle": ":",
+        "grid.linewidth": 0.7,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+    })
 # -----------------------------
 # Data
 # -----------------------------
@@ -238,7 +310,7 @@ def download_prices():
         print(f"Downloading {ticker}")
         close = download_massive_agg_series(ticker, name=ticker, adjusted=True)
         series_list.append(close)
-        time.sleep({SLEEP_BETWEEN_OPENAI_CALLS})
+        time.sleep(SLEEP_BETWEEN_OPENAI_CALLS)
 
     prices = pd.concat(series_list, axis=1).sort_index().ffill().dropna()
     prices.to_csv(cache_file)
@@ -575,7 +647,14 @@ def risk_parity_weights(cov, names):
     return normalize_weights(res.x, names)
 
 
-def forecasting_pomdp_policy_weights(mu_hist, mu_view, cov, belief, names):
+def forecasting_pomdp_policy_weights(
+    mu_hist,
+    mu_view,
+    cov,
+    belief,
+    names,
+    config,
+):
     """
     Forecasting POMDP policy:
     hidden state -> return views -> BL posterior -> constrained utility optimization.
@@ -583,13 +662,15 @@ def forecasting_pomdp_policy_weights(mu_hist, mu_view, cov, belief, names):
 
     cov = np.asarray(cov)
 
+    mu_hist_shrunk = config.prior_shrinkage * mu_hist
+
     mu_post = black_litterman_blend(
-        mu_hist=mu_hist,
+        mu_hist=mu_hist_shrunk,
         mu_view=mu_view,
         cov=cov,
         names=names,
         tau=0.25,
-        view_weight=0.65,
+        view_weight=config.view_weight,
     )
 
     b = pd.Series(belief, index=LLM_STATES)
@@ -598,7 +679,13 @@ def forecasting_pomdp_policy_weights(mu_hist, mu_view, cov, belief, names):
     p_growth = b["AI_Boom"] + 0.5 * b["Soft_Landing"]
 
     # Risk aversion rises in stress regimes
-    lam = 2.0 + 8.0 * p_stress - 1.0 * p_growth
+
+    
+    lam = (
+        config.risk_aversion
+        + 8.0 * p_stress
+        - 1.0 * p_growth
+        )
     lam = float(np.clip(lam, 1.5, 10.0))
 
     n = len(names)
@@ -820,6 +907,9 @@ class BacktestConfig:
     use_openai: bool = False
     openai_every_n_rebalances: int = 1
     disclosure_mode: str = "full"
+    prior_shrinkage: float = 0.25
+    risk_aversion: float = 3.5
+    view_weight: float = 0.65
 
 
 def get_rebalance_dates(rets):
@@ -832,129 +922,226 @@ def get_rebalance_dates(rets):
     return dates
 
 
-def heuristic_expected_returns(names, window, belief):
-    """
-    Deterministic fallback when config.use_openai=False.
+def macro_only_expected_returns(features, names, config):
+    mu = pd.Series(0.0, index=names)
 
-    Produces regime-aware expected returns using:
-        - momentum
-        - volatility penalty
-        - POMDP hidden state
+    risk_score = float(features.get("risk_score", 0.0))
+
+    for name in names:
+        if name in ["GLD", "TLT"]:
+            mu[name] += 0.03 * risk_score
+        else:
+            mu[name] -= 0.02 * risk_score
+
+    return mu
+
+
+def realized_proxy_state_label(fwd_returns, names):
+    """
+    Creates an ex post proxy label for the latent state using realized
+    forward returns.
+
+    This is not the true hidden state. It is a validation proxy used to
+    evaluate whether inferred beliefs are directionally aligned with
+    realized market conditions.
     """
 
-    b = pd.Series(
-        belief,
-        index=LLM_STATES,
-    )
+    r = fwd_returns[names].mean()
+
+    growth_assets = [x for x in ["NVDA", "MSFT", "GOOGL", "AAPL", "AMZN"] if x in names]
+    defensive_assets = [x for x in ["GLD", "TLT"] if x in names]
+    cyclical_assets = [x for x in ["JPM", "IBM", "XOM"] if x in names]
+
+    growth_ret = fwd_returns[growth_assets].mean(axis=1).add(1).prod() - 1 if growth_assets else 0.0
+    defensive_ret = fwd_returns[defensive_assets].mean(axis=1).add(1).prod() - 1 if defensive_assets else 0.0
+    cyclical_ret = fwd_returns[cyclical_assets].mean(axis=1).add(1).prod() - 1 if cyclical_assets else 0.0
+    all_ret = fwd_returns[names].mean(axis=1).add(1).prod() - 1
+
+    scores = {
+        "AI_Boom": growth_ret,
+        "Soft_Landing": all_ret + 0.5 * cyclical_ret,
+        "Inflation_Shock": defensive_ret + 0.5 * cyclical_ret,
+        "Recession": defensive_ret - all_ret,
+        "Crisis": defensive_ret - growth_ret,
+    }
+
+    return max(scores, key=scores.get)
+
+
+def daily_strategy_returns_from_weights(rets, weights_df, strategy, names):
+    rows = weights_df[weights_df["strategy"] == strategy].copy()
+    rows["date"] = pd.to_datetime(rows["date"])
+    rows = rows.sort_values("date")
+
+    daily_parts = []
+
+    for i in range(len(rows)):
+        start = rows.iloc[i]["date"]
+
+        if i + 1 < len(rows):
+            end = rows.iloc[i + 1]["date"]
+            daily = rets.loc[(rets.index > start) & (rets.index <= end), names]
+        else:
+            daily = rets.loc[rets.index > start, names]
+
+        if daily.empty:
+            continue
+
+        w = rows.iloc[i][names].astype(float).values
+        strat_ret = daily.values @ w
+
+        daily_parts.append(
+            pd.Series(strat_ret, index=daily.index)
+        )
+
+    if not daily_parts:
+        return pd.Series(dtype=float)
+
+    return pd.concat(daily_parts).sort_index()    
+
+def belief_only_expected_returns(belief, names, config):
+    mu = pd.Series(0.0, index=names)
+
+    ai_boom = float(belief.get("AI_Boom", 0.0))
+    soft = float(belief.get("Soft_Landing", 0.0))
+    inflation = float(belief.get("Inflation_Shock", 0.0))
+    recession = float(belief.get("Recession", 0.0))
+    crisis = float(belief.get("Crisis", 0.0))
+
+    for name in names:
+        if name in ["NVDA", "MSFT", "GOOGL", "AMZN"]:
+            mu[name] += 0.08 * ai_boom + 0.03 * soft
+            mu[name] -= 0.04 * recession + 0.05 * crisis
+
+        elif name in ["GLD"]:
+            mu[name] += 0.05 * inflation + 0.04 * crisis
+
+        elif name in ["TLT"]:
+            mu[name] += 0.05 * recession + 0.03 * crisis
+            mu[name] -= 0.03 * inflation
+
+        else:
+            mu[name] += 0.02 * soft
+            mu[name] -= 0.03 * recession + 0.03 * crisis
+
+    return mu
+
+def heuristic_expected_returns(
+    names,
+    window,
+    belief,
+    macro_features=None,
+    use_market=True,
+    use_macro=True,
+    use_beliefs=True,
+):
+    """
+    Regime-aware expected returns.
+
+    Ablation controls:
+        use_market  : momentum and volatility terms
+        use_macro   : VIX, oil, credit, rates terms
+        use_beliefs : POMDP hidden-state belief terms
+    """
+
+    if isinstance(belief, dict):
+        b = pd.Series(belief).reindex(LLM_STATES).fillna(0.0)
+    else:
+        b = pd.Series(belief, index=LLM_STATES)
+
+    if macro_features is None:
+        macro_features = {}
+
+    vix = float(macro_features.get("vix_level", 0.0))
+    vix_chg = float(macro_features.get("vix_21d_change", 0.0))
+    oil_ret = float(macro_features.get("oil_21d_return", 0.0))
+    gold_ret = float(macro_features.get("gold_21d_return", 0.0))
+    credit = float(macro_features.get("credit_spread_proxy", 0.0))
+    y10_chg = float(macro_features.get("ust10y_21d_change", 0.0))
 
     forecasts = {}
 
     for ticker in names:
 
+        forecast = 0.03
+
         r = window[ticker]
 
-        mom_21 = (
-            (1 + r.tail(21)).prod() - 1
-        )
+        if use_market:
+            mom_21 = (1 + r.tail(21)).prod() - 1
+            mom_63 = (1 + r.tail(63)).prod() - 1
+            vol = r.tail(63).std() * np.sqrt(252)
 
-        mom_63 = (
-            (1 + r.tail(63)).prod() - 1
-        )
+            annual_momentum = 0.5 * mom_21 * 12 + 0.5 * mom_63 * 4
 
-        vol = (
-            r.tail(63).std()
-            * np.sqrt(252)
-        )
+            forecast += 0.40 * annual_momentum
+            forecast -= 0.08 * vol
 
-        annual_momentum = (
-            0.5 * mom_21 * 12
-            +
-            0.5 * mom_63 * 4
-        )
-
-        forecast = (
-            0.03
-            +
-            0.40 * annual_momentum
-        )
-
-        # Growth names
-        if ticker in [
-            "NVDA",
-            "MSFT",
-            "GOOGL",
-            "AAPL",
-            "AMZN",
-        ]:
-
-            forecast += (
-                0.10 * b["AI_Boom"]
-                +
-                0.05 * b["Soft_Landing"]
-                -
-                0.08 * b["Recession"]
-                -
-                0.15 * b["Crisis"]
+        if use_macro:
+            risk_pressure = (
+                0.02 * max(vix - 20.0, 0.0)
+                + 0.03 * max(vix_chg, 0.0)
+                + 0.50 * max(credit, 0.0)
             )
 
-        # Defensive names
-        if ticker in [
-            "GLD",
-            "TLT",
-        ]:
-
-            forecast += (
-                0.08 * b["Recession"]
-                +
-                0.12 * b["Crisis"]
+            inflation_pressure = (
+                0.50 * max(oil_ret, 0.0)
+                + 0.50 * max(y10_chg, 0.0)
             )
 
-        # Inflation beneficiaries
-        if ticker == "GLD":
+            if ticker in ["NVDA", "MSFT", "GOOGL", "AAPL", "AMZN"]:
+                forecast -= risk_pressure
+                forecast -= 0.30 * inflation_pressure
 
-            forecast += (
-                0.10
-                * b["Inflation_Shock"]
-            )
+            elif ticker in ["GLD"]:
+                forecast += 0.40 * inflation_pressure
+                forecast += 0.30 * risk_pressure
+                forecast += 0.20 * gold_ret
 
-        if ticker == "TLT":
+            elif ticker in ["TLT"]:
+                forecast += 0.20 * risk_pressure
+                forecast -= 0.50 * inflation_pressure
 
-            forecast -= (
-                0.10
-                * b["Inflation_Shock"]
-            )
+            elif ticker in ["JPM", "IBM", "XOM"]:
+                forecast -= 0.50 * risk_pressure
+                forecast += 0.20 * inflation_pressure
 
-        # Value / cyclical names
-        if ticker in [
-            "JPM",
-            "IBM",
-            "XOM",
-        ]:
+        if use_beliefs:
 
-            forecast += (
-                0.05 * b["Soft_Landing"]
-                +
-                0.05 * b["Inflation_Shock"]
-                -
-                0.08 * b["Crisis"]
-            )
+            if ticker in ["NVDA", "MSFT", "GOOGL", "AAPL", "AMZN"]:
+                forecast += (
+                    0.10 * b["AI_Boom"]
+                    + 0.05 * b["Soft_Landing"]
+                    - 0.08 * b["Recession"]
+                    - 0.15 * b["Crisis"]
+                )
 
-        # Risk penalty
-        forecast -= (
-            0.08 * vol
-        )
+            if ticker in ["GLD", "TLT"]:
+                forecast += (
+                    0.08 * b["Recession"]
+                    + 0.12 * b["Crisis"]
+                )
 
-        forecasts[ticker] = (
-            forecast / 252.0
-        )
+            if ticker == "GLD":
+                forecast += 0.10 * b["Inflation_Shock"]
 
-    return (
-        pd.Series(forecasts)
-        .reindex(names)
-        .values
-    )
+            if ticker == "TLT":
+                forecast -= 0.10 * b["Inflation_Shock"]
 
-def run_backtest(rets, macro, config):
+            if ticker in ["JPM", "IBM", "XOM"]:
+                forecast += (
+                    0.05 * b["Soft_Landing"]
+                    + 0.05 * b["Inflation_Shock"]
+                    - 0.08 * b["Crisis"]
+                )
+
+        forecasts[ticker] = forecast / 252.0
+
+    return pd.Series(forecasts).reindex(names).values
+
+    
+
+def run_backtest(rets, macro, config, ablation_mode="Full_POMDP_Macro_Inferred_Beliefs"):
     names = RISKY
     spy = BENCHMARK
 
@@ -1091,11 +1278,66 @@ def run_backtest(rets, macro, config):
             })
 
         else:
-            mu_view = heuristic_expected_returns(
-                names,
-                window,
-                belief,
-            )
+            neutral_belief = np.ones(len(LLM_STATES)) / len(LLM_STATES)
+
+            if ablation_mode == "Historical_Only":
+
+                mu_view = config.prior_shrinkage * mu
+
+            elif ablation_mode == "Market_Only":
+
+                mu_view = heuristic_expected_returns(
+                    names=names,
+                    window=window,
+                    belief=neutral_belief,
+                    macro_features=None,
+                    use_market=True,
+                    use_macro=False,
+                    use_beliefs=False,
+                )
+
+            elif ablation_mode == "Market_Plus_Direct_Macro":
+
+                mu_view = heuristic_expected_returns(
+                    names=names,
+                    window=window,
+                    belief=neutral_belief,
+                    macro_features=macro_features,
+                    use_market=True,
+                    use_macro=True,
+                    use_beliefs=False,
+                )
+
+            elif ablation_mode == "Market_Plus_Beliefs":
+
+                mu_view = heuristic_expected_returns(
+                    names=names,
+                    window=window,
+                    belief=belief,
+                    macro_features=None,
+                    use_market=True,
+                    use_macro=False,
+                    use_beliefs=True,
+                )
+
+            elif ablation_mode == "Full_POMDP_Macro_Inferred_Beliefs":
+
+                # Full model: macro variables are used upstream to infer the belief state.
+                # They are NOT added again as a direct expected-return adjustment.
+                mu_view = heuristic_expected_returns(
+                    names=names,
+                    window=window,
+                    belief=belief,
+                    macro_features=None,
+                    use_market=True,
+                    use_macro=False,
+                    use_beliefs=True,
+                )
+
+            else:
+                raise ValueError(f"Unknown ablation_mode: {ablation_mode}")
+        mu_view = np.asarray(mu_view, dtype=float)   
+
 
         weights["Forecasting_POMDP"] = forecasting_pomdp_policy_weights(
             mu_hist=mu,
@@ -1103,6 +1345,7 @@ def run_backtest(rets, macro, config):
             cov=cov,
             belief=belief,
             names=names,
+            config=config,
         )
 
         if config.use_openai and i % config.openai_every_n_rebalances == 0:
@@ -1162,6 +1405,11 @@ def run_backtest(rets, macro, config):
             ),
         }
 
+        belief_row["proxy_state"] = realized_proxy_state_label(
+            fwd_returns=fwd,
+            names=names,
+        )
+
         belief_row.update(macro_features)
         belief_history.append(belief_row)
 
@@ -1179,16 +1427,210 @@ def run_backtest(rets, macro, config):
 
     weights_df = pd.DataFrame(weights_history)
     belief_df = pd.DataFrame(belief_history)
+    if "date" in belief_df.columns:
+        belief_df["date"] = pd.to_datetime(belief_df["date"])
+        belief_df = belief_df.set_index("date")
 
     return wealth_df, weights_df, belief_df, agent_logs
 # -----------------------------
 # Metrics
 # -----------------------------
 
+import numpy as np
+import pandas as pd
+
+
+def annualized_sharpe(r):
+    r = np.asarray(r)
+    if np.std(r) < 1e-12:
+        return np.nan
+
+    return (
+        np.mean(r)
+        /
+        np.std(r)
+        *
+        np.sqrt(252)
+    )
+
+
+def stationary_bootstrap_indices(
+    n,
+    avg_block=20,
+):
+    """
+    Politis-Romano stationary bootstrap.
+    """
+
+    p = 1.0 / avg_block
+
+    idx = np.empty(n, dtype=int)
+
+    idx[0] = np.random.randint(0, n)
+
+    for t in range(1, n):
+
+        if np.random.rand() < p:
+            idx[t] = np.random.randint(0, n)
+
+        else:
+            idx[t] = (idx[t - 1] + 1) % n
+
+    return idx
+
+def bootstrap_sharpe_difference(
+    returns_a,
+    returns_b,
+    n_boot=2000,
+    avg_block=20,
+):
+    """
+    Difference:
+        Sharpe(A) - Sharpe(B)
+    """
+
+    returns_a = np.asarray(returns_a)
+    returns_b = np.asarray(returns_b)
+
+    n = len(returns_a)
+
+    diffs = []
+
+    for _ in range(n_boot):
+
+        idx = stationary_bootstrap_indices(
+            n,
+            avg_block=avg_block,
+        )
+
+        sa = annualized_sharpe(
+            returns_a[idx]
+        )
+
+        sb = annualized_sharpe(
+            returns_b[idx]
+        )
+
+        diffs.append(sa - sb)
+
+    diffs = np.asarray(diffs)
+
+    diff_hat = (
+        annualized_sharpe(returns_a)
+        -
+        annualized_sharpe(returns_b)
+    )
+
+    ci_low = np.percentile(diffs, 2.5)
+    ci_high = np.percentile(diffs, 97.5)
+
+    return {
+        "Difference": diff_hat,
+        "CI Low": ci_low,
+        "CI High": ci_high,
+    } 
+
 def max_drawdown(wealth):
     running_max = wealth.cummax()
     dd = wealth / running_max - 1
     return dd.min()
+
+
+def belief_coverage_test_table(
+    belief_df,
+    outdir=OUT,
+):
+    """
+    Kupiec-style unconditional coverage test for belief states.
+
+    For each latent state s, test whether:
+
+        mean_t p_t(s) = mean_t 1{proxy_state_t = s}
+
+    where p_t(s) is the inferred belief probability.
+
+    This is an approximate coverage test because the true latent state is
+    unobserved and proxy_state is constructed ex post.
+    """
+
+    df = belief_df.copy()
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+
+    if "proxy_state" not in df.columns:
+        raise ValueError("belief_df must contain proxy_state.")
+
+    rows = []
+    eps = 1e-12
+
+    for state in LLM_STATES:
+        p = pd.to_numeric(df[state], errors="coerce").clip(eps, 1 - eps)
+        y = (df["proxy_state"] == state).astype(float)
+
+        valid = p.notna() & y.notna()
+        p = p.loc[valid]
+        y = y.loc[valid]
+
+        n = len(y)
+        observed = int(y.sum())
+        expected = float(p.sum())
+
+        observed_rate = observed / n
+        expected_rate = expected / n
+
+        # Pearson chi-square coverage statistic:
+        # compares observed vs expected event counts.
+        denom1 = max(expected, eps)
+        denom0 = max(n - expected, eps)
+
+        coverage_stat = (
+            ((observed - expected) ** 2) / denom1
+            +
+            (((n - observed) - (n - expected)) ** 2) / denom0
+        )
+
+        p_value = 1.0 - chi2.cdf(coverage_stat, df=1)
+
+        rows.append({
+            "State": state.replace("_", " "),
+            "Observations": n,
+            "Observed Count": observed,
+            "Expected Count": expected,
+            "Observed Rate": observed_rate,
+            "Expected Rate": expected_rate,
+            "Coverage Statistic": coverage_stat,
+            "p-value": p_value,
+            "Reject 5%": "Yes" if p_value < 0.05 else "No",
+        })
+
+    out = pd.DataFrame(rows)
+
+    csv_path = f"{outdir}/table_8_belief_coverage.csv"
+    tex_path = f"{outdir}/table_8_belief_coverage.tex"
+
+    out.to_csv(csv_path, index=False)
+
+    latex = out.to_latex(
+        index=False,
+        float_format="%.3f",
+        caption=(
+            "Kupiec-style unconditional coverage test for inferred belief states "
+            "using ex post proxy latent-state labels. The null hypothesis is that "
+            "the average inferred belief probability equals the empirical proxy-state "
+            "frequency."
+        ),
+        label="tab:belief_coverage",
+        escape=False,
+    )
+
+    with open(tex_path, "w") as f:
+        f.write(latex)
+
+    print("Saved belief coverage table:", tex_path)
+
+    return out    
 
 
 def performance_table(wealth_df):
@@ -1247,97 +1689,762 @@ def utility_table(wealth_df):
     )
 
 
-# -----------------------------
-# Figures
-# -----------------------------
+def generate_ablation_table_5(results, outdir="pomdp_results"):
+    """
+    results should be a dict:
+    {
+        "Historical_Only": {"Sharpe": ..., "mean_variance_utility": ...},
+        ...
+    }
+    """
 
-def plot_wealth(wealth_df):
-    plt.figure(figsize=(11, 6))
-    for col in wealth_df.columns:
-        plt.plot(wealth_df.index, wealth_df[col], label=col)
-    plt.title("Cumulative wealth: POMDP agent vs benchmarks")
-    plt.xlabel("Date")
-    plt.ylabel("Wealth")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{OUT}/figure_1_cumulative_wealth.png", dpi=200)
-    plt.close()
-
-
-def plot_drawdowns(wealth_df):
-    plt.figure(figsize=(11, 6))
-    for col in wealth_df.columns:
-        dd = wealth_df[col] / wealth_df[col].cummax() - 1
-        plt.plot(wealth_df.index, dd, label=col)
-    plt.title("Drawdowns")
-    plt.xlabel("Date")
-    plt.ylabel("Drawdown")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{OUT}/figure_2_drawdowns.png", dpi=200)
-    plt.close()
-
-
-def plot_beliefs(belief_df):
-    if belief_df.empty:
-        print("No belief history to plot.")
-        return
-
-    plt.figure(figsize=(11, 6))
-
-    for s in LLM_STATES:
-        if s in belief_df.columns:
-            plt.plot(pd.to_datetime(belief_df["date"]), belief_df[s], label=s)
-
-    plt.title("LLM-inferred POMDP hidden-state beliefs")
-    plt.xlabel("Date")
-    plt.ylabel("Posterior probability")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{OUT}/figure_3_llm_belief_state.png", dpi=200)
-    plt.close()
-
-
-def plot_sharpe_bar(perf):
-    plt.figure(figsize=(10, 5))
-    plt.bar(perf["strategy"], perf["Sharpe"])
-    plt.title("Sharpe ratio by strategy")
-    plt.xlabel("Strategy")
-    plt.ylabel("Sharpe")
-    plt.xticks(rotation=35, ha="right")
-    plt.tight_layout()
-    plt.savefig(f"{OUT}/figure_4_sharpe_by_strategy.png", dpi=200)
-    plt.close()
-
-
-def plot_privacy_frontier(results_by_mode):
     rows = []
-    info_score = {"risk_only": 1, "full": 5}
 
-    for mode, perf in results_by_mode.items():
-        row = perf[perf["strategy"] == "OpenAI_POMDP_Agent"].iloc[0]
+    labels = {
+        "Historical_Only": "Historical Only",
+        "Market_Only": "Market Only",
+        "Market_Plus_Direct_Macro": "Market + Direct Macro",
+        "Market_Plus_Beliefs": "Market + Beliefs",
+        "Full_POMDP_Macro_Inferred_Beliefs": "Full POMDP: Macro-Inferred Beliefs",
+    }
+
+    for key in ABLATION_MODES:
         rows.append({
-            "mode": mode,
-            "information_disclosure": info_score.get(mode, 3),
-            "sharpe": row["Sharpe"],
-            "terminal_wealth": row["TerminalWealth"],
+            "Model": labels[key],
+            "Sharpe": results[key]["Sharpe"],
+            "Utility": results[key]["Utility"],
         })
 
     df = pd.DataFrame(rows)
 
-    plt.figure(figsize=(7, 5))
-    plt.scatter(df["information_disclosure"], df["sharpe"])
-    for _, row in df.iterrows():
-        plt.text(row["information_disclosure"], row["sharpe"], row["mode"])
-    plt.title("Privacy-performance frontier")
-    plt.xlabel("Information disclosure score")
-    plt.ylabel("Agent Sharpe")
-    plt.tight_layout()
-    plt.savefig(f"{OUT}/figure_5_privacy_performance_frontier.png", dpi=200)
-    plt.close()
+    path_csv = f"{outdir}/table_5_ablation_study.csv"
+    path_tex = f"{outdir}/table_5_ablation_study.tex"
+
+    df.to_csv(path_csv, index=False)
+
+    latex = df.to_latex(
+        index=False,
+        float_format="%.3f",
+        caption="Ablation study showing the contribution of macro variables, LLM-inferred beliefs, and the full Forecasting POMDP framework.",
+        label="tab:ablation",
+        escape=False,
+    )
+
+    with open(path_tex, "w") as f:
+        f.write(latex)
+
+    print("Saved Table 5:", path_tex)
 
     return df
 
+def generate_belief_calibration_table(
+    belief_df,
+    outdir=OUT,
+):
+    """
+    Generates belief calibration diagnostics using proxy realized state labels.
+
+    Columns required:
+        LLM_STATES probabilities
+        proxy_state
+    """
+
+    df = belief_df.copy()
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+
+    missing = [s for s in LLM_STATES if s not in df.columns]
+    if missing:
+        raise ValueError(f"Missing belief columns: {missing}")
+
+    if "proxy_state" not in df.columns:
+        raise ValueError("belief_df must contain proxy_state column.")
+
+    rows = []
+
+    eps = 1e-12
+
+    for state in LLM_STATES:
+        p = pd.to_numeric(df[state], errors="coerce").clip(eps, 1.0)
+        y = (df["proxy_state"] == state).astype(float)
+
+        brier = float(np.mean((p - y) ** 2))
+        log_score = float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p.clip(eps, 1.0 - eps))))
+
+        avg_prob = float(p.mean())
+        empirical_freq = float(y.mean())
+        calibration_gap = avg_prob - empirical_freq
+
+        rows.append({
+            "State": state.replace("_", " "),
+            "Average Belief": avg_prob,
+            "Empirical Frequency": empirical_freq,
+            "Calibration Gap": calibration_gap,
+            "Brier Score": brier,
+            "Log Score": log_score,
+        })
+
+    out = pd.DataFrame(rows)
+
+    csv_path = f"{outdir}/table_7_belief_calibration.csv"
+    tex_path = f"{outdir}/table_7_belief_calibration.tex"
+
+    out.to_csv(csv_path, index=False)
+
+    latex = out.to_latex(
+        index=False,
+        float_format="%.3f",
+        caption=(
+            "Belief calibration diagnostics using ex post proxy latent-state labels. "
+            "The proxy labels are constructed from realized forward returns and are used "
+            "only for validation diagnostics; they are not observed by the agent."
+        ),
+        label="tab:belief_calibration",
+        escape=False,
+    )
+
+    with open(tex_path, "w") as f:
+        f.write(latex)
+
+    print("Saved Table 7:", tex_path)
+
+    return out
+
+def generate_table_8_significance_daily(
+    ablation_daily_returns,
+    outdir=OUT,
+    n_boot=5000,
+    avg_block=21,
+):
+    comparisons = [
+        (
+            "Market + Beliefs vs Market Only",
+            "Market_Plus_Beliefs",
+            "Market_Only",
+        ),
+        (
+            "Market + Beliefs vs Historical Only",
+            "Market_Plus_Beliefs",
+            "Historical_Only",
+        ),
+        (
+            "Full POMDP vs Market Only",
+            "Full_POMDP_Macro_Inferred_Beliefs",
+            "Market_Only",
+        ),
+    ]
+
+    rows = []
+
+    for label, a, b in comparisons:
+        ra = ablation_daily_returns[a]
+        rb = ablation_daily_returns[b]
+
+        common = ra.index.intersection(rb.index)
+        ra = ra.loc[common].values
+        rb = rb.loc[common].values
+
+        stats = bootstrap_sharpe_difference(
+            ra,
+            rb,
+            n_boot=n_boot,
+            avg_block=avg_block,
+        )
+
+        rows.append({
+            "Comparison": label,
+            "Sharpe Difference": stats["Difference"],
+            "95% CI Lower": stats["CI Low"],
+            "95% CI Upper": stats["CI High"],
+            "Significant": "Yes" if stats["CI Low"] > 0 else "No",
+        })
+
+    df = pd.DataFrame(rows)
+
+    csv_path = f"{outdir}/table_8_significance_daily.csv"
+    tex_path = f"{outdir}/table_8_significance_daily.tex"
+
+    df.to_csv(csv_path, index=False)
+
+    latex = df.to_latex(
+        index=False,
+        float_format="%.3f",
+        caption=(
+            "Stationary-bootstrap confidence intervals for Sharpe-ratio "
+            "differences using daily portfolio returns from the ablation study."
+        ),
+        label="tab:significance_daily",
+        escape=False,
+    )
+
+    with open(tex_path, "w") as f:
+        f.write(latex)
+
+    print("Saved Table 8:", tex_path)
+
+    return df
+# -----------------------------
+# Figures
+# -----------------------------
+
+
+def truncate_to_today_or_last_trading_day(df, end_date=None):
+    if end_date is None:
+        end_date = pd.Timestamp.today().normalize()
+    else:
+        end_date = pd.Timestamp(end_date).normalize()
+
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    df = df[df.index <= end_date]
+
+    if df.empty:
+        raise ValueError("No data available up to end_date.")
+
+    last_trading_day = df.index.max()
+    print(f"Plotting through nearest trading day: {last_trading_day.date()}")
+
+    return df
+
+def clean_time_index(df):
+    out = df.copy()
+
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None)
+        out = out.dropna(subset=["date"]).set_index("date")
+    else:
+        out.index = pd.to_datetime(out.index, errors="coerce")
+        out = out.loc[~out.index.isna()]
+        out.index = out.index.tz_localize(None)
+
+    return out.sort_index()
+
+
+def restrict_to_belief_columns(belief_df):
+    belief_df = clean_time_index(belief_df)
+
+    available = [c for c in BELIEF_STATE_COLS if c in belief_df.columns]
+
+    # fallback if your labels use spaces rather than underscores
+    if not available:
+        rename_map = {
+            "AI Boom": "AI_Boom",
+            "Soft Landing": "Soft_Landing",
+            "Inflation Shock": "Inflation_Shock",
+        }
+        belief_df = belief_df.rename(columns=rename_map)
+        available = [c for c in BELIEF_STATE_COLS if c in belief_df.columns]
+
+    if not available:
+        raise ValueError(
+            f"No belief-state columns found. Columns are: {list(belief_df.columns)}"
+        )
+
+    out = belief_df[available].apply(pd.to_numeric, errors="coerce")
+    out = out.dropna(how="all")
+
+    return out
+
+def add_belief_event_band(event_ax, events=BELIEF_EVENTS):
+    event_ax.set_ylim(0, 1)
+    event_ax.set_yticks([])
+    event_ax.grid(False)
+
+    for spine in event_ax.spines.values():
+        spine.set_visible(False)
+
+    for i, (date_str, label) in enumerate(events):
+        d = pd.to_datetime(date_str)
+        y = 0.22 if i % 2 == 0 else 0.62
+
+        event_ax.axvline(d, color="0.20", lw=0.8, alpha=0.45)
+
+        event_ax.text(
+            d,
+            y,
+            "\n".join(textwrap.wrap(label, 18)),
+            ha="center",
+            va="center",
+            fontsize=7,
+            color="0.15",
+            bbox=dict(
+                boxstyle="round,pad=0.25",
+                facecolor="white",
+                edgecolor="0.75",
+                linewidth=0.5,
+                alpha=0.95,
+            ),
+        )
+
+    event_ax.set_xlabel(
+        "Selected events used only for ex post interpretation of inferred beliefs",
+        fontsize=8,
+        color="0.35",
+    )
+
+def clean_index(df):
+    out = df.copy()
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    return out.sort_index()
+
+
+def clean_label(x):
+    return str(x).replace("_", " ")
+
+
+def save_figure(fig, outdir, name):
+    os.makedirs(outdir, exist_ok=True)
+
+    png_path = os.path.join(outdir, f"{name}.png")
+    pdf_path = os.path.join(outdir, f"{name}.pdf")
+
+    fig.savefig(png_path, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+
+    return png_path, pdf_path
+
+
+def format_date_axis(ax):
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+    ax.tick_params(axis="x", length=0)
+
+
+def add_event_band(event_ax, events=MACRO_EVENTS):
+    """
+    Adds a clean separate event band underneath the main plot.
+    This avoids label collisions with data and legends.
+    """
+    event_ax.set_ylim(0, 1)
+    event_ax.set_yticks([])
+    event_ax.grid(False)
+
+    for spine in event_ax.spines.values():
+        spine.set_visible(False)
+
+    for i, (date_str, label) in enumerate(events):
+        d = pd.to_datetime(date_str)
+        y = 0.15 if i % 2 == 0 else 0.55
+
+        event_ax.axvline(d, color="0.25", lw=0.7, alpha=0.45)
+        event_ax.text(
+            d,
+            y,
+            "\n".join(textwrap.wrap(label, 16)),
+            rotation=0,
+            ha="center",
+            va="center",
+            fontsize=7,
+            color="0.20",
+            bbox=dict(
+                boxstyle="round,pad=0.22",
+                facecolor="white",
+                edgecolor="0.80",
+                linewidth=0.4,
+                alpha=0.92,
+            ),
+        )
+
+    event_ax.set_xlabel("Macroeconomic and market event annotations", fontsize=8, color="0.35")
+
+
+def make_event_figure(figsize=(7.4, 4.8)):
+    """
+    Creates a main plot plus a lower event annotation band.
+    """
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(
+        2,
+        1,
+        height_ratios=[5.0, 1.15],
+        hspace=0.05,
+        figure=fig,
+    )
+
+    ax = fig.add_subplot(gs[0])
+    event_ax = fig.add_subplot(gs[1], sharex=ax)
+
+    return fig, ax, event_ax
+
+
+def generate_parameter_sensitivity_table(
+    rets,
+    macro,
+    base_config,
+    outdir=OUT,
+):
+    rows = []
+
+    wealth_base, weights_base, belief_base, logs_base = run_backtest(
+        rets,
+        macro,
+        base_config,
+        ablation_mode="Full_POMDP_Macro_Inferred_Beliefs",
+    )
+
+    perf_base = performance_table(wealth_base)
+    util_base = utility_table(wealth_base)
+
+    perf_row = perf_base.loc[
+        perf_base["strategy"] == "Forecasting_POMDP"
+    ].iloc[0]
+
+    util_row = util_base.loc[
+        util_base["strategy"] == "Forecasting_POMDP"
+    ].iloc[0]
+
+    rows.append({
+        "Parameter": "BASE MODEL",
+        "Value": np.nan,
+        "Base Value": np.nan,
+        "Sharpe": perf_row["Sharpe"],
+        "Utility": util_row["mean_variance_utility"],
+        "MaxDrawdown": perf_row["MaxDrawdown"],
+    })
+
+    base_values = {
+        "risk_aversion": base_config.risk_aversion,
+        "prior_shrinkage": base_config.prior_shrinkage,
+        "view_weight": base_config.view_weight,
+    }
+
+    for param, values in SENSITIVITY_GRID.items():
+        for value in values:
+            cfg = replace(base_config, **{param: value})
+
+            wealth_s, weights_s, belief_s, logs_s = run_backtest(
+                rets,
+                macro,
+                cfg,
+                ablation_mode="Full_POMDP_Macro_Inferred_Beliefs",
+            )
+
+            perf_s = performance_table(wealth_s)
+            util_s = utility_table(wealth_s)
+
+            row_perf = perf_s.loc[
+                perf_s["strategy"] == "Forecasting_POMDP"
+            ].iloc[0]
+
+            row_util = util_s.loc[
+                util_s["strategy"] == "Forecasting_POMDP"
+            ].iloc[0]
+
+            rows.append({
+                "Parameter": param.replace("_", " "),
+                "Value": value,
+                "Base Value": base_values[param],
+                "Sharpe": row_perf["Sharpe"],
+                "Utility": row_util["mean_variance_utility"],
+                "MaxDrawdown": row_perf["MaxDrawdown"],
+            })
+
+    df = pd.DataFrame(rows)
+
+    csv_path = f"{outdir}/table_6_parameter_sensitivity.csv"
+    tex_path = f"{outdir}/table_6_parameter_sensitivity.tex"
+
+    df.to_csv(csv_path, index=False)
+
+
+    df["Value"] = df["Value"].fillna("")
+    df["Base Value"] = df["Base Value"].fillna("")
+
+    latex = df.to_latex(
+        index=False,
+        float_format="%.3f",
+        caption=(
+            "Parameter sensitivity analysis for the Forecasting POMDP. "
+            "Each row varies one parameter while holding all other parameters "
+            "fixed at their base values."
+        ),
+        label="tab:sensitivity",
+        escape=False,
+    )
+
+    with open(tex_path, "w") as f:
+        f.write(latex)
+
+    print("Saved Table 6:", tex_path)
+
+    return df
+
+# ============================================================
+# Figure 1: cumulative wealth
+# ============================================================
+
+def plot_journal_cumulative_wealth(wealth_df, outdir="pomdp_results", plot_end_date=None):
+    set_quant_journal_style()
+    wealth_df = clean_time_index(wealth_df)
+
+    xmin = wealth_df.index.min()
+    #xmax = wealth_df.index.max()
+
+    if plot_end_date is None:
+        xmax = wealth_df.index.max()
+    else:
+        xmax = pd.to_datetime(plot_end_date)
+
+    fig, ax, event_ax = make_event_figure()
+
+    for col in wealth_df.columns:
+        lw = 2.2 if "Forecasting" in col else 1.35
+        ax.plot(wealth_df.index, wealth_df[col], lw=lw, label=clean_label(col))
+
+    ax.set_title("Cumulative Wealth by Strategy")
+    ax.set_ylabel("Wealth Index")
+    ax.grid(True)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.22),
+        ncol=3,
+        frameon=False,
+        handlelength=2.0,
+    )
+
+    add_belief_event_band(event_ax)
+
+    ax.set_xlim(xmin, xmax)
+    event_ax.set_xlim(xmin, xmax)
+
+    plt.setp(ax.get_xticklabels(), visible=False)
+    format_date_axis(event_ax)
+
+    return save_figure(fig, outdir, "figure_1_cumulative_wealth_journal")
+# ============================================================
+# Figure 2: drawdowns
+# ============================================================
+
+def compute_drawdowns(wealth_df):
+    return wealth_df / wealth_df.cummax() - 1.0
+
+
+def plot_journal_drawdowns(wealth_df, outdir="pomdp_results", plot_end_date=None):
+    set_quant_journal_style()
+    wealth_df = clean_time_index(wealth_df)
+    dd = compute_drawdowns(wealth_df)
+
+    xmin = dd.index.min()
+    #xmax = dd.index.max()
+    if plot_end_date is None:
+        xmax = dd.index.max()
+    else:
+        xmax = pd.to_datetime(plot_end_date)
+
+    fig, ax, event_ax = make_event_figure()
+
+    for col in dd.columns:
+        lw = 2.2 if "Forecasting" in col else 1.35
+        ax.plot(dd.index, dd[col], lw=lw, label=clean_label(col))
+
+    ax.axhline(0, color="0.25", lw=0.8)
+    ax.set_title("Drawdowns by Strategy")
+    ax.set_ylabel("Drawdown")
+    ax.yaxis.set_major_formatter(lambda x, pos: f"{100*x:.0f}%")
+    ax.grid(True)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.22),
+        ncol=3,
+        frameon=False,
+        handlelength=2.0,
+    )
+
+    add_belief_event_band(event_ax)
+
+    ax.set_xlim(xmin, xmax)
+    event_ax.set_xlim(xmin, xmax)
+
+    plt.setp(ax.get_xticklabels(), visible=False)
+    format_date_axis(event_ax)
+
+    return save_figure(fig, outdir, "figure_2_drawdowns_journal")
+
+# ============================================================
+# Figure 3: LLM belief states
+# ============================================================
+
+def plot_journal_llm_beliefs(belief_df, outdir="pomdp_results", plot_end_date=None):
+    set_quant_journal_style()
+
+    belief_df = restrict_to_belief_columns(belief_df)
+
+    fig, ax, event_ax = make_event_figure(figsize=(7.4, 5.0))
+
+    for col in belief_df.columns:
+        lw = 2.2 if col == "Crisis" else 1.55
+        ax.plot(
+            belief_df.index,
+            belief_df[col],
+            lw=lw,
+            label=col.replace("_", " "),
+        )
+
+    xmin = belief_df.index.min()
+    #xmax = belief_df.index.max()
+
+    if plot_end_date is None:
+        xmax = belief_df.index.max()
+    else:
+        xmax = pd.to_datetime(plot_end_date)
+
+    ax.set_xlim(xmin, xmax)
+    event_ax.set_xlim(xmin, xmax)
+
+    ax.set_title("LLM-Inferred Posterior Beliefs over Latent Market States")
+    ax.set_ylabel("Posterior Probability")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True)
+
+    plt.setp(ax.get_xticklabels(), visible=False)
+    format_date_axis(event_ax)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.24),
+        ncol=3,
+        frameon=False,
+        handlelength=2.0,
+    )
+
+    add_belief_event_band(event_ax)
+
+    return save_figure(fig, outdir, "figure_3_llm_belief_state_journal")
+
+# ============================================================
+# Figure 4: Sharpe ratios
+# ============================================================
+
+def plot_journal_sharpe(perf_df, outdir="pomdp_results"):
+    set_quant_journal_style()
+
+    df = perf_df.copy()
+    if "strategy" in df.columns:
+        df = df.set_index("strategy")
+
+    df = df.sort_values("Sharpe", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+
+    labels = [clean_label(x) for x in df.index]
+    values = df["Sharpe"].astype(float).values
+
+    bars = ax.barh(labels, values, height=0.58)
+
+    ax.set_title("Sharpe Ratio by Strategy")
+    ax.set_xlabel("Sharpe Ratio")
+    ax.set_ylabel("")
+    ax.grid(True, axis="x")
+    ax.grid(False, axis="y")
+
+    xmax = max(values) * 1.15
+    ax.set_xlim(0, xmax)
+
+    for bar, value in zip(bars, values):
+        ax.text(
+            value + xmax * 0.015,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.3f}",
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+
+    return save_figure(fig, outdir, "figure_4_sharpe_by_strategy_journal")
+
+
+# ============================================================
+# Figure 5: normalized macro signals
+# ============================================================
+
+def plot_journal_macro_panel(macro_df, outdir="pomdp_results"):
+    set_quant_journal_style()
+    macro_df = clean_index(macro_df)
+
+    candidate_cols = [
+        "VIXY",
+        "tenY",
+        "USO",
+        "GLD",
+        "HYG",
+        "LQD",
+        "credit_proxy",
+        "Credit",
+        "credit_spread",
+    ]
+
+    cols = [c for c in candidate_cols if c in macro_df.columns]
+
+    if not cols:
+        print("No recognized macro columns found. Skipping macro panel.")
+        return None
+
+    normed = macro_df[cols].dropna().copy()
+    normed = normed / normed.iloc[0]
+
+    fig, ax, event_ax = make_event_figure()
+
+    for col in normed.columns:
+        ax.plot(normed.index, normed[col], lw=1.55, label=clean_label(col))
+
+    ax.set_title("Normalized Macro and Market Signals Used by the Filter")
+    ax.set_ylabel("Index, first observation = 1")
+    ax.grid(True)
+
+    format_date_axis(event_ax)
+    plt.setp(ax.get_xticklabels(), visible=False)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.22),
+        ncol=3,
+        frameon=False,
+        handlelength=2.0,
+    )
+
+    add_belief_event_band(event_ax)
+
+    return save_figure(fig, outdir, "figure_5_macro_signals_journal")
+
+
+# ============================================================
+# Generate all figures
+# ============================================================
+
+def generate_all_journal_figures(
+    wealth_df,
+    belief_df,
+    perf_df,
+    macro_df=None,
+    outdir="pomdp_results",
+    plot_end_date=None,
+):
+    paths = []
+
+    paths.append(plot_journal_cumulative_wealth(wealth_df, outdir, plot_end_date=plot_end_date))
+    paths.append(plot_journal_drawdowns(wealth_df, outdir, plot_end_date=plot_end_date))
+
+    if belief_df is not None and len(belief_df) > 0:
+        paths.append(plot_journal_llm_beliefs(belief_df, outdir, plot_end_date=plot_end_date))
+
+    paths.append(plot_journal_sharpe(perf_df, outdir))
+
+    if macro_df is not None:
+        macro_path = plot_journal_macro_panel(macro_df, outdir)
+        if macro_path is not None:
+            paths.append(macro_path)
+
+    print("\nJournal-grade figures saved:")
+    for p in paths:
+        print("  ", p)
+
+    return paths
 
 # -----------------------------
 # Main
@@ -1362,6 +2469,76 @@ def main():
     perf = performance_table(wealth_df)
     util = utility_table(wealth_df)
 
+
+    # -------------------------------------------------
+    # TABLE 5: ABLATION STUDY
+    # -------------------------------------------------
+
+    ablation_results = {}
+    ablation_daily_returns = {}
+    ablation_wealth = {}
+
+    for mode in ABLATION_MODES:
+        print(f"\nRunning ablation: {mode}")
+
+        wealth_a, weights_a, belief_a, logs_a = run_backtest(
+            rets,
+            macro,
+            BacktestConfig(use_openai=False),
+            ablation_mode=mode,
+        )
+        ablation_daily_returns[mode] = daily_strategy_returns_from_weights(
+            rets=rets,
+            weights_df=weights_a,
+            strategy="Forecasting_POMDP",
+            names=RISKY,
+        )
+
+        ablation_wealth[mode] = wealth_a["Forecasting_POMDP"].copy()
+
+        perf_a = performance_table(wealth_a)
+        util_a = utility_table(wealth_a)
+
+        row = perf_a.loc[
+            perf_a["strategy"] == "Forecasting_POMDP"
+        ].iloc[0]
+
+        util_row = util_a.loc[
+            util_a["strategy"] == "Forecasting_POMDP"
+        ].iloc[0]
+
+        ablation_results[mode] = {
+            "Sharpe": row["Sharpe"],
+            "Utility": util_row["mean_variance_utility"],
+        }
+
+    table5 = generate_ablation_table_5(
+        ablation_results,
+        outdir=OUT,
+    )
+
+    table6 = generate_parameter_sensitivity_table(
+        rets=rets,
+        macro=macro,
+        base_config=BacktestConfig(use_openai=False),
+        outdir=OUT,
+    )
+
+    table7 = generate_belief_calibration_table(
+        belief_df=belief_df,
+        outdir=OUT,
+    )
+
+
+    table8 = belief_coverage_test_table(
+        belief_df=belief_df,
+        outdir=OUT,
+    )
+    #table8 = generate_table_8_significance_daily(
+    #    ablation_daily_returns=ablation_daily_returns,
+    #    outdir=OUT,
+    #)
+
     wealth_df.to_csv(f"{OUT}/wealth_paths.csv")
     weights_df.to_csv(f"{OUT}/weights_history.csv", index=False)
     belief_df.to_csv(f"{OUT}/belief_history.csv", index=False)
@@ -1383,10 +2560,34 @@ def main():
         "tab:utility",
     )
 
-    plot_wealth(wealth_df)
-    plot_drawdowns(wealth_df)
-    plot_beliefs(belief_df)
-    plot_sharpe_bar(perf)
+    
+
+    end_date = pd.Timestamp("2026-06-14").normalize()
+
+    wealth_df = truncate_to_today_or_last_trading_day(wealth_df, end_date=end_date)
+    belief_df = truncate_to_today_or_last_trading_day(belief_df, end_date=end_date)
+    macro = truncate_to_today_or_last_trading_day(macro, end_date=end_date)
+
+
+    print("prices max:", prices.index.max())
+    print("rets max:", rets.index.max())
+    print("wealth_df max:", wealth_df.index.max())
+    print("belief_df max:", belief_df.index.max())
+    print("macro max:", macro.index.max())  
+
+    generate_all_journal_figures(
+        wealth_df=wealth_df,
+        belief_df=belief_df,
+        perf_df=perf,
+        macro_df=macro,
+        outdir="pomdp_results",
+        plot_end_date=rets.index.max()
+    )
+
+    #plot_wealth(wealth_df)
+    #plot_drawdowns(wealth_df)
+    #plot_beliefs(belief_df)
+    #plot_sharpe_bar(perf)
 
     print("\nTABLE 1: PERFORMANCE")
     print(perf.to_string(index=False))
